@@ -1,0 +1,35 @@
+[Unit]
+Description=Anker Solix MI80 → InfluxDB Live Service
+After=network-online.target influxd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ── Pfade anpassen ──────────────────────────────────────────
+# WorkingDir muss das geklonte anker-solix-api Repo enthalten (für "from api.api import ...")
+# Beispiel: wenn du das Repo nach /opt/anker-solix-api geklont hast:
+WorkingDirectory=/opt/anker-solix-api
+# Das anker-solix-influx Repo daneben:
+# /opt/anker-solix-influx  ← dort liegt das uv-Projekt
+
+# uv-Pfad ermitteln: `which uv`
+ExecStart=/home/DEIN_USER/.local/bin/uv run \
+    --project /opt/anker-solix-influx \
+    solix-live-service
+
+# .env wird aus dem WorkingDirectory geladen
+EnvironmentFile=/opt/anker-solix-influx/.env
+
+Restart=on-failure
+RestartSec=30s
+# Logs gehen nach journald (abrufbar mit: journalctl -fu solix-live.service)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=solix-live
+
+# Sicherheit
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
