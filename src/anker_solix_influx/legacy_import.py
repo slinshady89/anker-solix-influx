@@ -84,7 +84,7 @@ async def _fetch_intraday(api, site_id: str, device_sn: str, day: date) -> list[
         data = await api.energy_analysis(
             siteId=site_id,
             deviceSn=device_sn,
-            rangeType="day",
+            rangeType="hourly",
             startDay=datetime.combine(day, datetime.min.time()),
             endDay=datetime.combine(day, datetime.min.time()),
             devType="solar_production",

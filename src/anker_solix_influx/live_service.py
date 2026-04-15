@@ -1,23 +1,21 @@
 """
-live_service.py
-===============
-Dauerhafter Service: Pollt die Anker Cloud alle 60 Sekunden und schreibt
-Echtzeit-Leistungs- und Energiedaten in InfluxDB v1.8.
+Persistent service polling Anker Cloud and writing real-time power & status
+data to InfluxDB v1.8.
 
-Measurement: anker_solar_live
-Fields:
-  solar_power_w      – Momentanleistung in Watt
-  today_energy_wh    – Energie heute (Wh, Tageszähler)
-  <ggf. weitere>     – alle numerischen Felder die die API liefert
-
+Measurement: power
 Tags:
-  device_sn          – Seriennummer des MI80
-  source             – "live_service"
+  device_id          – Device identifier (anker-pv)
+  phase              – Phase (blank for total)
+Fields (float):
+  active             – Active power in Watts (from generate_power)
 
-Hinweis zum Poll-Intervall:
-  Die Anker Cloud aktualisiert Gerätedaten ca. alle 60 Sekunden.
-  Minütliches Polling macht daher Sinn – kürzere Intervalle liefern
-  identische Werte und erhöhen nur das API-Ratenlimit-Risiko.
+Measurement: status
+Tags:
+  device_id          – Device identifier (anker-pv)
+Fields:
+  online             – Online status (1.0=online, 0.0=offline)
+
+Note: Polls Anker Cloud at configured interval. Anker API updates ~60s cadence.
 """
 
 from __future__ import annotations
@@ -35,95 +33,37 @@ from .config import Settings, get_influx_client, load_settings
 
 log = logging.getLogger(__name__)
 
-POLL_INTERVAL_SECONDS = 60
-# Nach diesem vielfachen schlägt ein Re-Login fehl → neu initialisieren
-REAUTH_INTERVAL = 60 * 60  # jede Stunde Token erneuern
+POLL_INTERVAL_SECONDS = 30  # twice per minute polling
+REAUTH_INTERVAL = 60 * 60  # Hourly token refresh
 
 
-# ──────────────────────────────────────────────────────────────
-# Daten-Extraktion aus api.sites / api.devices
-# ──────────────────────────────────────────────────────────────
+def _extract_power_fields(device: dict) -> dict[str, float] | None:
+    """Extract active power from generate_power. Returns None if unavailable."""
+    try:
+        power_val = float(device.get("generate_power", 0))
+        return {"active": power_val}
+    except (TypeError, ValueError):
+        return None
 
-def _extract_live_fields(api, device_sn: str) -> dict[str, float]:
-    """
-    Liest Momentan-Werte aus dem API-Cache nach update_sites().
-    Die genauen Keys hängen von der MI80-Firmware ab – robustes Mapping.
-    """
-    fields: dict[str, float] = {}
 
-    # Gerät aus dem devices-Cache
-    dev = (api.devices or {}).get(device_sn, {})
-
-    # Bekannte Keys für Momentanleistung (Watt)
-    for pk in (
-        "solar_power_w",
-        "generate_power",
-        "solar_power",
-        "pv_power",
-        "ac_power",
-        "power_w",
-    ):
-        v = dev.get(pk)
-        if v is not None:
-            try:
-                fields["solar_power_w"] = float(v)
-                break
-            except (TypeError, ValueError):
-                pass
-
-    # Bekannte Keys für Tagesenergie (Wh oder kWh)
-    for ek, scale in (
-        ("today_solar_energy_kwh", 1000.0),
-        ("today_solar_energy", 1000.0),
-        ("solar_energy_today_kwh", 1000.0),
-        ("today_energy_kwh", 1000.0),
-        ("today_solar_energy_wh", 1.0),
-        ("today_energy_wh", 1.0),
-        ("generate_energy", 1.0),
-    ):
-        v = dev.get(ek)
-        if v is not None:
-            try:
-                fields["today_energy_wh"] = float(v) * scale
-                break
-            except (TypeError, ValueError):
-                pass
-
-    # Status als numerischen Code speichern (1=online, 0=offline)
-    online = dev.get("wifi_online") or dev.get("is_online") or dev.get("status")
-    if online is not None:
+def _extract_status_fields(device: dict) -> dict[str, float] | None:
+    """Extract status as boolean (1.0 online, 0.0 offline). Returns None if unavailable."""
+    status_val = device.get("status")
+    if status_val is not None:
         try:
-            fields["online"] = float(bool(online))
+            status_bool = bool(int(status_val) if isinstance(status_val, str) else status_val)
+            return {"online": 1.0 if status_bool else 0.0}
         except (TypeError, ValueError):
-            pass
+            return None
+    return None
 
-    # Alle weiteren numerischen Felder generisch übernehmen
-    skip = {"device_sn", "type", "name", "alias", "model", "version"}
-    for k, v in dev.items():
-        if k in skip or k in fields:
-            continue
-        if isinstance(v, (int, float)) and not isinstance(v, bool):
-            fields[k] = float(v)
-        elif isinstance(v, str):
-            try:
-                fields[k] = float(v)
-            except ValueError:
-                pass
-
-    return fields
-
-
-# ──────────────────────────────────────────────────────────────
-# Service-Schleife
-# ──────────────────────────────────────────────────────────────
 
 async def run_service(cfg: Settings) -> None:
-    log.info("Live-Service gestartet. Poll-Intervall: %d s.", POLL_INTERVAL_SECONDS)
+    log.info(f"Live service started. Poll interval: {POLL_INTERVAL_SECONDS}s")
 
     influx = get_influx_client(cfg)
-    measurement = cfg.influx_measurement + "_live"
 
-    # Mögliche Sites und Devices werden beim ersten Poll ermittelt
+    # Track site → inverter device mapping
     inverter_map: dict[str, str] = {}  # site_id → device_sn
 
     async with ClientSession() as websession:
@@ -131,7 +71,7 @@ async def run_service(cfg: Settings) -> None:
             from api.api import AnkerSolixApi  # type: ignore[import]
         except ModuleNotFoundError as exc:
             raise RuntimeError(
-                "Anker Solix API nicht gefunden. Bitte README beachten."
+                "Anker Solix API not found. See README for setup instructions."
             ) from exc
 
         api = AnkerSolixApi(
@@ -142,20 +82,20 @@ async def run_service(cfg: Settings) -> None:
             log,
         )
 
-        log.info("Erster Login …")
+        log.info("Initial authentication...")
         await api.async_authenticate()
         await api.update_sites()
         await api.update_device_details()
 
-        # Inverter-Map aufbauen
+        # Build inverter mapping
         for site_id, site in (api.sites or {}).items():
             if str(site_id).startswith("virtual-") and site.get("solar_list"):
                 device_sn = site_id.split("-", 1)[1] if "-" in site_id else site_id
                 inverter_map[site_id] = device_sn
-                log.info("Gefundener Inverter: SN=%s  site=%s", device_sn, site_id)
+                log.info(f"Found inverter: SN={device_sn} site={site_id}")
 
         if not inverter_map:
-            log.error("Keine Standalone-Inverter gefunden – Service beendet.")
+            log.error("No standalone inverters found. Service exiting.")
             influx.close()
             return
 
@@ -165,61 +105,73 @@ async def run_service(cfg: Settings) -> None:
         while True:
             loop_start = time.monotonic()
 
-            # Stündlicher Re-Auth (Token-Erneuerung)
+            # Hourly token refresh
             if loop_start - last_reauth > REAUTH_INTERVAL:
-                log.debug("Token-Erneuerung …")
+                log.debug("Refreshing authentication token...")
                 try:
                     await api.async_authenticate()
                     last_reauth = loop_start
                 except Exception as exc:  # noqa: BLE001
-                    log.warning("Token-Erneuerung fehlgeschlagen: %s", exc)
+                    log.warning(f"Token refresh failed: {exc}")
 
             try:
                 await api.update_sites()
             except Exception as exc:  # noqa: BLE001
-                log.warning("update_sites() fehlgeschlagen: %s", exc)
+                log.warning(f"update_sites() failed: {exc}")
 
             now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            points = []
+            power_points = []
+            status_points = []
 
             for site_id, device_sn in inverter_map.items():
-                fields = _extract_live_fields(api, device_sn)
+                device = (api.devices or {}).get(device_sn, {})
 
-                if not fields:
-                    log.debug(
-                        "Keine Felder für SN=%s – API-Cache leer oder Gerät offline.",
-                        device_sn,
-                    )
-                    # Trotzdem einen Punkt mit online=0 schreiben
-                    fields = {"online": 0.0}
+                # Power measurement: active, apparent, factor (all floats, no strings)
+                power_fields = _extract_power_fields(device)
+                if power_fields:
+                    power_points.append({
+                        "measurement": "power",
+                        "tags": {"device_id": "anker-pv", "phase": ""},
+                        "time": now_utc,
+                        "fields": power_fields,
+                    })
+                else:
+                    log.debug(f"No power fields extracted for SN={device_sn}")
 
-                points.append({
-                    "measurement": measurement,
-                    "tags": {
-                        "device_sn": device_sn,
-                        "source": "live_service",
-                    },
-                    "time": now_utc,
-                    "fields": fields,
-                })
+                # Status measurement: online, energy, other numeric fields
+                status_fields = _extract_status_fields(device)
+                if status_fields:
+                    status_points.append({
+                        "measurement": "status",
+                        "tags": {"device_id": "anker-pv"},
+                        "time": now_utc,
+                        "fields": status_fields,
+                    })
+                else:
+                    log.debug(f"No status fields extracted for SN={device_sn}")
 
-            if points:
+            # Write power points (active/apparent/factor all floats with f suffix)
+            if power_points:
                 try:
-                    influx.write_points(points, time_precision="s")
+                    influx.write_points(power_points, time_precision="s")
                 except Exception as exc:  # noqa: BLE001
-                    log.error("InfluxDB write fehlgeschlagen: %s", exc)
+                    log.error(f"InfluxDB power write failed: {exc}")
+
+            # Write status points
+            if status_points:
+                try:
+                    influx.write_points(status_points, time_precision="s")
+                except Exception as exc:  # noqa: BLE001
+                    log.error(f"InfluxDB status write failed: {exc}")
 
             poll_count += 1
             if poll_count % 10 == 0:
-                log.info(
-                    "Poll #%d abgeschlossen. Felder: %s",
-                    poll_count,
-                    list(points[0]["fields"].keys()) if points else "–",
-                )
+                fields_count = len(power_points[0]["fields"]) if power_points else 0
+                log.info(f"Poll #{poll_count} completed. Power fields: {fields_count}")
             else:
-                log.debug("Poll #%d → %d Punkte geschrieben.", poll_count, len(points))
+                log.debug(f"Poll #{poll_count} → {len(power_points)} power + {len(status_points)} status points written")
 
-            # Wartezeit bis zum nächsten Poll (genau 60 s von Loop-Start)
+            # Wait until next poll cycle
             elapsed = time.monotonic() - loop_start
             sleep_for = max(0.0, POLL_INTERVAL_SECONDS - elapsed)
             await asyncio.sleep(sleep_for)
@@ -235,12 +187,12 @@ def main_cli() -> None:
     try:
         asyncio.run(run_service(cfg))
     except KeyboardInterrupt:
-        log.info("Service durch Benutzer beendet.")
+        log.info("Service terminated by user.")
     except ClientError as exc:
-        log.error("Netzwerkfehler: %s", exc)
+        log.error(f"Network error: {exc}")
         sys.exit(1)
     except Exception as exc:  # noqa: BLE001
-        log.exception("Unerwarteter Fehler: %s", exc)
+        log.exception(f"Unexpected error: {exc}")
         sys.exit(1)
 
 

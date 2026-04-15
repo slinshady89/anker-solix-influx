@@ -17,6 +17,8 @@ dependencies = [
     "aiofiles>=23.2.0",
     # Crypto (required by anker-solix-api)
     "cryptography>=42.0.0",
+    # MQTT (required by anker-solix-api)
+    "paho-mqtt>=1.6.1",
 ]
 
 [project.scripts]
