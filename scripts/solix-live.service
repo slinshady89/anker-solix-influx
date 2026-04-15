@@ -8,7 +8,7 @@ Type=simple
 # Working directory contains anker-solix-api for "from api.api import ..."
 WorkingDirectory=/home/nils/shelly/anker-solix-api
 # Project directory with uv pyproject.toml
-ExecStart=/home/nils/.local/bin/uv run \
+ExecStart=/usr/bin/uv run \
     --project /home/nils/shelly/anker-solix-influx \
     solix-live-service
 
